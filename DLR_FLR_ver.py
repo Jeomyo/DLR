@@ -88,10 +88,8 @@ class resnext_block(nn.Module):
 
 
 class Encoder(nn.Module):
-    def __init__(self, in_channels, base_ch=16, use_flr=True):
+    def __init__(self, in_channels, base_ch=16):
         super().__init__()
-
-        self.use_flr = use_flr
 
         # full > 1/2 (conv 1)
         self.conv00 = conv(in_channels, base_ch, stride=2) # 채널 3 > 16
@@ -115,55 +113,25 @@ class Encoder(nn.Module):
         self.res4_0 = resnext_block(base_ch*8, base_ch*16, stride=2, groups=2, has_proj=True) # 채널 128 > 256
         self.res4_1 = resnext_block(base_ch*16, base_ch*16, stride=1, groups=2, has_proj=False) # 해상도, 채널 유지 및 표현력 증가
         self.res4_2 = resnext_block(base_ch*16, base_ch*16, stride=1, groups=2, has_proj=False) # 해상도, 채널 유지 및 표현력 증가
-
-        self.flr_1_4  = FLR_Module(channels=base_ch*2)   # 32ch
-        self.flr_1_8  = FLR_Module(channels=base_ch*4)   # 64ch
-        self.flr_1_16 = FLR_Module(channels=base_ch*8)   # 128ch
         
-    def forward(self,x,pp_inst=None):
+    def forward(self,x):
         # full > 1/2
         x0 = self.conv00(x)
-        
-        if pp_inst is not None:
-            if pp_inst.dim() == 4:
-                assert pp_inst.size(1) == 1, "pp_inst must be [B,1,H,W] or [B,H,W]"
-                pp_inst = pp_inst[:, 0, :, :]
-            elif pp_inst.dim() != 3:
-                raise ValueError(f"pp_inst must be [B,H,W] or [B,1,H,W], got {pp_inst.shape}")
 
         # 1/2 > 1/4 
         x1= self.res1_0(x0)
         x1= self.res1_1(x1)
         x1= self.res1_2(x1)
 
-        if self.use_flr and (pp_inst is not None):
-            if not hasattr(self, "_flr_debug_printed"):
-                print(f"[Encoder] FLR ON: applying at 1/4. "
-                    f"feat x1 = {x1.shape}, pp_inst = {pp_inst.shape}")
-                self._flr_debug_printed = True
-            x1 = self.flr_1_4(x1, pp_inst)
-
         # 1/4 > 1/8
         x2= self.res2_0(x1)
         x2= self.res2_1(x2)
         x2= self.res2_2(x2)
 
-        if self.use_flr and (pp_inst is not None):
-            if not hasattr(self, "_flr_debug_printed_1_8"):
-                print(f"[Encoder] FLR ON: applying at 1/8. x2={x2.shape}")
-                self._flr_debug_printed_1_8 = True
-            x2 = self.flr_1_8(x2, pp_inst)
-
         # 1/8 > 1/16
         x3= self.res3_0(x2)
         x3= self.res3_1(x3)
         x3= self.res3_2(x3)
-
-        if self.use_flr and (pp_inst is not None):
-            if not hasattr(self, "_flr_debug_printed_1_16"):
-                print(f"[Encoder] FLR ON: applying at 1/16. x3={x3.shape}")
-                self._flr_debug_printed_1_16 = True
-            x3 = self.flr_1_16(x3, pp_inst)
 
         # 1/16 > 1/32
         x4= self.res4_0(x3)
@@ -263,25 +231,32 @@ class Decoder(nn.Module):
 
 
 class Network(nn.Module):
-    def __init__(self, use_flr: bool = True):
+    def __init__(self):
         super().__init__()
 
-        self.encoder = Encoder(in_channels=3, base_ch=16, use_flr=use_flr)
+        self.encoder = Encoder(in_channels=3, base_ch=16)
         self.decoder = Decoder(base_ch=16, num_features=256, max_depth=80.0)
 
-        self.use_flr = use_flr
+        # 🔥 FLR teacher modules (feature-level regularizer)
+        H_2 = 16
+        H_4 = 32
+        H_8 = 64
+        H_16 = 128
 
-        print(f"[Network.__init__] use_flr = {self.use_flr}")
+        self.use_flr = False
+        self.flr_1_4  = FLR_Module(H_4)
+        self.flr_1_8  = FLR_Module(H_8)
+        self.flr_1_16 = FLR_Module(H_16)
 
-    def forward(self, img, pp_inst=None) -> torch.Tensor:
-        """
-        img: [B, 3, H, W]  (padding 된 상태)
-        return: depth [B, 1, H, W]
-        """
-        x0, x1, x2, x3, x4 = self.encoder(img, pp_inst=pp_inst)
+    def forward(self, img) -> torch.Tensor:
+        x0, x1, x2, x3, x4 = self.encoder(img)
         depth = self.decoder(x0, x1, x2, x3, x4, img)
         return depth
 
+    def forward_with_feats(self, img) -> torch.Tensor:
+        x0, x1, x2, x3, x4 = self.encoder(img)
+        depth = self.decoder(x0, x1, x2, x3, x4, img)
+        return depth, (x0, x1, x2, x3, x4)
 
     @staticmethod
     def make_torch_tensor(data:Union[np.ndarray, torch.Tensor], device, dtype) -> torch.Tensor:
@@ -360,11 +335,59 @@ class Network(nn.Module):
         label_mask = self.padding(self.make_torch_tensor(mini_batch_data['label_mask'], self.device, self.dtype))
         pp_inst = self.padding(self.make_torch_tensor(mini_batch_data['pp_inst'], self.device, torch.long))
         #pp_sem = self.padding(self.make_torch_tensor(mini_batch_data['pp_sem'], self.device, torch.long))
-        #pp_valid_mask = self.padding(self.make_torch_tensor(mini_batch_data['pp_valid_mask'], self.device, self.dtype))
+        pp_valid_mask = self.padding(self.make_torch_tensor(mini_batch_data['pp_valid_mask'], self.device, self.dtype))
 
-        pred = self.forward(img, pp_inst=pp_inst)
+        pred, (x0, x1, x2, x3, x4) = self.forward_with_feats(img)
 
-        loss = self.get_loss_l1_smooth(pred, label, label_mask)
+        l1_loss = self.get_loss_l1_smooth(pred, label, label_mask)
+        flr_loss = pred.new_tensor(0.0)
+
+        if self.use_flr:
+            # pp_inst 형태 정리: [B,H,W] 또는 [B,1,H,W] 둘 다 허용
+            if pp_inst.dim() == 4:
+                assert pp_inst.size(1) == 1, f"pp_inst must be [B,1,H,W] or [B,H,W], got {pp_inst.shape}"
+                pp_inst_feat = pp_inst[:, 0]          # [B,H,W]
+            elif pp_inst.dim() == 3:
+                pp_inst_feat = pp_inst                 # [B,H,W]
+            else:
+                raise ValueError(f"pp_inst must be [B,H,W] or [B,1,H,W], got {pp_inst.shape}")
+
+            # 라이다 유효 + 파놉틱 유효 둘 다 만족하는 영역만 사용
+            valid = pp_valid_mask.detach()     # [B,1,H,W]
+
+            # 각 scale에 맞게 valid mask downsample
+            valid_1_4  = nnf.interpolate(valid, size=x1.shape[2:], mode='nearest')  # x1: 1/4
+            valid_1_8  = nnf.interpolate(valid, size=x2.shape[2:], mode='nearest')  # x2: 1/8
+            valid_1_16 = nnf.interpolate(valid, size=x3.shape[2:], mode='nearest')  # x3: 1/16
+
+            # 🔹 Teacher feature: FLR_Module(features_detach, pp_inst)
+            #    - feature는 detach: student만 teacher를 따라가게
+            #    - FLR_Module 파라미터는 학습됨 (detach 안 함)
+            x1_T = self.flr_1_4(x1.detach(),  pp_inst_feat)   # [B,32,H/4,W/4]
+            x2_T = self.flr_1_8(x2.detach(),  pp_inst_feat)   # [B,64,H/8,W/8]
+            x3_T = self.flr_1_16(x3.detach(), pp_inst_feat)   # [B,128,H/16,W/16]
+
+            def feat_loss(student_f, teacher_f, vmask):
+                """
+                student_f : [B,C,H,W]
+                teacher_f : [B,C,H,W]
+                vmask     : [B,1,H,W] (0/1)
+                """
+                v = (vmask > 0.5).float()          # 안전하게 binary
+                diff = (student_f - teacher_f) * v
+                # 채널까지 포함해서 valid 위치 전체에 대한 평균 L1
+                denom = v.sum() * student_f.shape[1] + 1e-6
+                return diff.abs().sum() / denom
+
+            L_1_4  = feat_loss(x1, x1_T, valid_1_4)
+            L_1_8  = feat_loss(x2, x2_T, valid_1_8)
+            L_1_16 = feat_loss(x3, x3_T, valid_1_16)
+
+            # 가중치는 일단 0.1씩, 나중에 튜닝
+            flr_loss = 0.1 * (L_1_4 + L_1_8 + L_1_16)
+
+        # 최종 loss = 기본 depth loss + FLR feature 정규화
+        loss = l1_loss + flr_loss
 
         # ---------------------- 시각화 (train_vis) ----------------------
 
@@ -415,18 +438,23 @@ class Network(nn.Module):
         with torch.no_grad():
             mae = (torch.abs(pred - label) * label_mask).sum() / (label_mask.sum() + 1e-6)
             rmse = torch.sqrt(((pred - label) ** 2 * label_mask).sum() / (label_mask.sum() + 1e-6))
+            print(
+            f"[TRAIN] label min={label.min().item():.3f}, max={label.max().item():.3f}, mean={label.mean().item():.3f}, "
+            f"pred min={pred.min().item():.3f}, max={pred.max().item():.3f}, mean={pred.mean().item():.3f}"
+            )
 
         monitors = {
             "train_loss": loss.detach(),
             "mae": mae.detach(),
             "rmse": rmse.detach(),
+            "flr_loss": flr_loss.detach(),
         }
 
         return loss, monitors
 
         # ----------------------------------------------------------------
 
-    def forward_eval(self, mini_batch_data: dict, use_flr=False):
+    def forward_eval(self, mini_batch_data: dict):
         """
         valid / test DataLoader에서 나온 mini_batch_data 하나를 받아서
         - padding + device/dtype 맞추고
@@ -440,14 +468,14 @@ class Network(nn.Module):
         img        = self.padding(self.make_torch_tensor(mini_batch_data["img"],   self.device, self.dtype))
         label      = self.padding(self.make_torch_tensor(mini_batch_data["label"], self.device, self.dtype))
         label_mask = self.padding(self.make_torch_tensor(mini_batch_data["label_mask"], self.device, self.dtype))
-        pp_inst = self.padding(self.make_torch_tensor(mini_batch_data['pp_inst'], self.device, torch.long))
+        #pp_inst = self.padding(self.make_torch_tensor(mini_batch_data['pp_inst'], self.device, torch.long))
         #pp_sem = self.padding(self.make_torch_tensor(mini_batch_data['pp_sem'], self.device, torch.long))
         #pp_valid_mask = self.padding(self.make_torch_tensor(mini_batch_data['pp_valid_mask'], self.device, self.dtype))
 
  
         with torch.no_grad():
             # 단일 스케일 depth 예측
-            pred = self.forward(img, pp_inst=pp_inst)  # [B, 1, H_pad, W_pad]
+            pred = self.forward(img)  # [B, 1, H_pad, W_pad]
 
         out = {
             "pred":       pred[:, :, :H, :W],       # [B, 1, H, W]
