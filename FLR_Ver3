@@ -1,0 +1,135 @@
+import math
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class FLR_Module(nn.Module):
+    """
+    Feature-Level Regularization (FLR) with
+    - Panoptic instance-aware gating
+    - 5x5 metric affinity (SGT-style)
+    - Local message passing + residual
+
+    features:      [B, C, H, W]
+    panoptic_mask: [B, H_orig, W_orig] (long, instance IDs, sky/void <= 0)
+    """
+    def __init__(
+        self,
+        channels: int,
+        kernel_size: int = 3,
+        sigma_sp: float = 1.0,
+        sigma_feat: float = 1.0,
+        eps: float = 1e-8,
+    ):
+        super().__init__()
+
+        assert kernel_size % 2 == 1, "kernel_size must be odd (e.g., 3 or 5)"
+        self.channels = channels
+        self.kernel_size = kernel_size
+        self.pad = kernel_size // 2
+        self.sigma_sp = sigma_sp
+        self.sigma_feat = sigma_feat
+        self.eps = eps
+
+        # 1x1 projection: W(F) → embedding space
+        self.W = nn.Conv2d(channels, channels, kernel_size=1, bias=True)
+
+        # 5x5 (or kxk) spatial Gaussian kernel, precomputed
+        spatial_kernel = []
+        radius = self.pad
+        for dy in range(-radius, radius + 1):
+            for dx in range(-radius, radius + 1):
+                dist2 = dy * dy + dx * dx
+                val = math.exp(-dist2 / (2.0 * (sigma_sp ** 2)))
+                spatial_kernel.append(val)
+        spatial_kernel = torch.tensor(spatial_kernel, dtype=torch.float32)  # [K*K]
+        # [1, K*K, 1, 1] → broadcast over H,W
+        self.register_buffer(
+            "spatial_kernel",
+            spatial_kernel.view(1, kernel_size * kernel_size, 1, 1)
+        )
+
+        # unfold for features / instances
+        self.unfold_feat = nn.Unfold(kernel_size=kernel_size, padding=self.pad, stride=1)
+        self.unfold_inst = nn.Unfold(kernel_size=kernel_size, padding=self.pad, stride=1)
+
+    def forward(self, features: torch.Tensor, panoptic_mask: torch.Tensor) -> torch.Tensor:
+        """
+        features:      [B, C, H, W]
+        panoptic_mask: [B, H_orig, W_orig]  (long, instance IDs, sky/void <= 0)
+        """
+        B, C, H, W = features.shape
+        device = features.device
+
+        # 1) panoptic mask → feature 해상도로 다운샘플
+        inst_mask = F.interpolate(
+            panoptic_mask.unsqueeze(1).float(),   # [B,1,H_orig,W_orig]
+            size=(H, W),
+            mode="nearest"
+        ).squeeze(1).long()                      # [B,H,W]
+
+        # 2) embedding projection + L2 normalize (metric space 고정)
+        F_proj = self.W(features)                                  # [B,C,H,W]
+        F_proj = F.normalize(F_proj, dim=1, eps=self.eps)          # [B,C,H,W]
+
+        # 3) KxK 패치로 펼치기
+        #    feat_patches: [B, C*K*K, H*W] -> [B, C, K*K, H, W]
+        feat_patches = self.unfold_feat(F_proj)                    # [B,C*K*K,H*W]
+        feat_patches = feat_patches.view(
+            B, C, self.kernel_size * self.kernel_size, H, W
+        )                                                          # [B,C,K*K,H,W]
+
+        #    inst_patches: [B, K*K, H*W] -> [B, K*K, H, W]
+        inst = inst_mask.unsqueeze(1).float()                      # [B,1,H,W]
+        inst_patches = self.unfold_inst(inst)                      # [B,K*K,H*W]
+        inst_patches = inst_patches.view(
+            B, self.kernel_size * self.kernel_size, H, W
+        )                                                          # [B,K*K,H,W]
+
+        # 4) center pixel (anchor) index
+        center_idx = (self.kernel_size * self.kernel_size) // 2    # 예: 5x5 → 12
+        inst_center = inst_patches[:, center_idx:center_idx+1, :, :]   # [B,1,H,W]
+
+        # 같은 인스턴스 여부
+        same_inst = (inst_patches == inst_center).float()          # [B,K*K,H,W]
+
+        # center가 유효 인스턴스(>0)인 곳만 사용 (sky/void 제외)
+        center_valid = (inst_center > 0).float()                   # [B,1,H,W]
+        same_inst = same_inst * center_valid                       # [B,K*K,H,W]
+
+        # 5) metric affinity: 코사인 거리 기반 Gaussian
+        #    center feature: [B,C,1,H,W]
+        F_center = feat_patches[:, :, center_idx:center_idx+1, :, :]       # [B,C,1,H,W]
+
+        # similarity = dot(F_i, F_j) (둘 다 L2 normalize 되어 있으므로 cosθ)
+        similarity = (feat_patches * F_center).sum(dim=1)                 # [B,K*K,H,W]
+
+        # cosine distance d = sqrt(2 - 2 cosθ)
+        dist2 = 2.0 - 2.0 * similarity
+        dist2 = torch.clamp(dist2, min=0.0)
+        dist = torch.sqrt(dist2 + self.eps)                               # [B,K*K,H,W]
+
+        if self.sigma_feat > 0:
+            feat_gauss = torch.exp(-dist / (2.0 * (self.sigma_feat ** 2)))  # [B,K*K,H,W]
+        else:
+            feat_gauss = torch.ones_like(dist)
+
+        # 6) spatial Gaussian (precomputed)
+        spatial = self.spatial_kernel.to(device)                          # [1,K*K,1,1]
+
+        # 7) 최종 affinity: α_ij = same_inst * spatial * feat_gauss
+        alpha = same_inst * feat_gauss                                    # [B,K*K,H,W]
+        alpha = alpha * spatial                                           # broadcast [1,K*K,1,1]
+
+        # 8) 정규화: α_hat_ij = α_ij / (∑_j α_ij + eps)
+        denom = alpha.sum(dim=1, keepdim=True) + self.eps                 # [B,1,H,W]
+        alpha_hat = alpha / denom                                         # [B,K*K,H,W]
+
+        # 9) message passing: ∑_j α_hat_ij * F_proj(j)
+        alpha_hat_exp = alpha_hat.unsqueeze(1)                            # [B,1,K*K,H,W]
+        F_tilde = (feat_patches * alpha_hat_exp).sum(dim=2)               # [B,C,H,W]
+
+        # 10) residual connection
+        F_out = features + F_tilde                                        # [B,C,H,W]
+        return F_out
